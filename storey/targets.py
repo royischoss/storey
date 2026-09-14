@@ -525,18 +525,19 @@ class ParquetTarget(_Batching, _Writer):
     :param flush_after_seconds: Maximum number of seconds to hold events before they are written. If None (default), all
         events will be written on flow termination, or after max_events are accumulated (if max_events is set).
     :type flush_after_seconds: int
-    :param flush_key_field: Event field used as the logical key for the public ``flush(flush_key)`` operation. Set to
-        ``"$key"`` to flush by event key, another ``"$attribute"`` to use event metadata, or a body field name. A
-        logical key is distinct from the physical partition path used to batch Parquet writes, allowing one fence to
-        cover all partitions for an event key. If None (default), keyed flush is disabled. Keyed flush is not supported
-        in single-file mode because later writes would overwrite previously flushed data.
-    :type flush_key_field: str
     :param storage_options: Extra options that make sense for a particular storage connection, e.g. host, port,
         username, password, etc., if using a URL that will be parsed by fsspec, e.g., starting
         "s3://”, "gcs://”. Optional.
     :param single_file: If True, all the partitioned data will be written to a single file named target.parquet in
         the specified path. If False (the default), each batch will be written to a separate file with a random uuid.
     :type storage_options: dict
+    :param flush_key_field: Keyword-only. Event field used as the logical key for the public ``flush(flush_key)``
+        operation. Set to ``"$key"`` to flush by event key, another ``"$attribute"`` to use event metadata, or a body
+        field name. A logical key is distinct from the physical partition path used to batch Parquet writes, allowing
+        one fence to cover all partitions for an event key. Every event reaching the target must resolve this field.
+        If None (default), keyed flush is disabled. Keyed flush is not supported in single-file mode because later
+        writes would overwrite previously flushed data.
+    :type flush_key_field: str
     """
 
     def __init__(
@@ -550,8 +551,9 @@ class ParquetTarget(_Batching, _Writer):
         infer_columns_from_data: Optional[bool] = None,
         max_events: Optional[int] = None,
         flush_after_seconds: Union[int, float, None] = None,
-        flush_key_field: Optional[str] = None,
         single_file: Optional[bool] = None,
+        *,
+        flush_key_field: Optional[str] = None,
         **kwargs,
     ):
         if flush_key_field is not None and not isinstance(flush_key_field, str):

@@ -1491,6 +1491,73 @@ def test_write_parquet_flush_key_field_rejects_callable(tmpdir):
         ParquetTarget(str(tmpdir), flush_key_field=lambda event: event.key)
 
 
+def test_parquet_flush_without_flush_key_field_is_rejected(tmpdir):
+    async def _test():
+        target = ParquetTarget(f"{tmpdir}/no-flush-key/", columns=["v"], partition_cols=[])
+        controller = build_flow([AsyncEmitSource(), target]).run()
+
+        with pytest.raises(ValueError, match="flush_key_field must be configured"):
+            await target.flush("endpoint-A")
+
+        await controller.terminate(wait=True)
+
+    asyncio.run(_test())
+
+
+async def async_test_write_parquet_flush_by_body_field(tmpdir):
+    out_dir = f"{tmpdir}/test_write_parquet_flush_by_body_field/{uuid.uuid4().hex}/"
+    target = ParquetTarget(
+        out_dir,
+        columns=["v", "endpoint"],
+        partition_cols=["endpoint"],
+        flush_key_field="endpoint",
+    )
+    controller = build_flow([AsyncEmitSource(), target, Complete()]).run()
+
+    await controller.emit({"v": 1, "endpoint": "endpoint-A"})
+    await controller.emit({"v": 2, "endpoint": "endpoint-B"})
+    await target.flush("endpoint-A")
+
+    # Only the fenced endpoint is on disk; endpoint-B stays buffered.
+    assert pq.read_table(out_dir).to_pandas()["v"].tolist() == [1]
+
+    await controller.terminate(wait=True)
+    assert sorted(pq.read_table(out_dir).to_pandas()["v"].tolist()) == [1, 2]
+
+
+def test_write_parquet_flush_by_body_field(tmpdir):
+    asyncio.run(async_test_write_parquet_flush_by_body_field(tmpdir))
+
+
+async def async_test_parquet_keyed_flush_with_active_timer(tmpdir):
+    out_dir = f"{tmpdir}/test_parquet_keyed_flush_with_active_timer/{uuid.uuid4().hex}/"
+    target = ParquetTarget(
+        out_dir,
+        columns=["v"],
+        partition_cols=["$key"],
+        flush_after_seconds=0.1,
+        flush_key_field="$key",
+    )
+    controller = build_flow([AsyncEmitSource(), target, Complete()]).run()
+
+    await controller.emit(Event({"v": 1}, key="endpoint-A"))
+    await target.flush("endpoint-A")
+    assert pq.read_table(out_dir).to_pandas()["v"].tolist() == [1]
+
+    # The timer is still running; whether it or the fence writes the next event,
+    # the fence must return only once that event is durable.
+    await controller.emit(Event({"v": 2}, key="endpoint-A"))
+    await asyncio.sleep(0.3)
+    await target.flush("endpoint-A")
+    assert sorted(pq.read_table(out_dir).to_pandas()["v"].tolist()) == [1, 2]
+
+    await controller.terminate(wait=True)
+
+
+def test_parquet_keyed_flush_with_active_timer(tmpdir):
+    asyncio.run(async_test_parquet_keyed_flush_with_active_timer(tmpdir))
+
+
 def test_flush_key_field_is_rejected_by_non_parquet_target(tmpdir):
     with pytest.raises(TypeError, match="only by ParquetTarget"):
         CSVTarget(f"{tmpdir}/events.csv", flush_key_field="$key")
