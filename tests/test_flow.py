@@ -1422,6 +1422,57 @@ def test_write_parquet_flush_by_logical_key(tmpdir):
     asyncio.run(async_test_write_parquet_flush_by_logical_key(tmpdir))
 
 
+async def async_test_write_parquet_flush_by_logical_key_isolates_other_keys(tmpdir):
+    out_dir = f"{tmpdir}/test_write_parquet_flush_isolation/{uuid.uuid4().hex}/"
+    target = ParquetTarget(
+        out_dir,
+        columns=["v"],
+        partition_cols=["$key", "$hour"],
+        flush_key_field="$key",
+    )
+    controller = build_flow([AsyncEmitSource(), target, Complete()]).run()
+
+    await controller.emit(Event({"v": 1}, key="endpoint-A", processing_time=datetime(2026, 1, 1, 10)))
+    await controller.emit(Event({"v": 2}, key="endpoint-B", processing_time=datetime(2026, 1, 1, 10)))
+    await target.flush(flush_key="endpoint-A")
+
+    assert pq.read_table(out_dir).to_pandas()["v"].tolist() == [
+        1
+    ], "Flushing one key must not write another key's buffered batch"
+
+    await controller.terminate(wait=True)
+
+    assert sorted(pq.read_table(out_dir).to_pandas()["v"].tolist()) == [
+        1,
+        2,
+    ], "The unflushed key must still be written on termination"
+
+
+def test_write_parquet_flush_by_logical_key_isolates_other_keys(tmpdir):
+    asyncio.run(async_test_write_parquet_flush_by_logical_key_isolates_other_keys(tmpdir))
+
+
+async def async_test_write_parquet_flush_by_logical_key_without_pending_batch(tmpdir):
+    out_dir = f"{tmpdir}/test_write_parquet_flush_noop/{uuid.uuid4().hex}/"
+    target = ParquetTarget(
+        out_dir,
+        columns=["v"],
+        partition_cols=["$key", "$hour"],
+        flush_key_field="$key",
+    )
+    controller = build_flow([AsyncEmitSource(), target, Complete()]).run()
+
+    await target.flush(flush_key="endpoint-never-seen")
+
+    assert not os.path.exists(out_dir), "A fence on an unknown key must not write anything"
+
+    await controller.terminate(wait=True)
+
+
+def test_write_parquet_flush_by_logical_key_without_pending_batch(tmpdir):
+    asyncio.run(async_test_write_parquet_flush_by_logical_key_without_pending_batch(tmpdir))
+
+
 def test_write_parquet_flush_by_logical_key_rejects_single_file(tmpdir):
     with pytest.raises(ValueError, match="single-file mode"):
         ParquetTarget(f"{tmpdir}/target.parquet", flush_key_field="$key")
