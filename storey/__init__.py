@@ -20,6 +20,7 @@ import v3iofs  # noqa: F401
 from .aggregations import AggregateByKey, QueryByKey  # noqa: F401
 from .dataframe import ReduceToDataFrame, ToDataFrame  # noqa: F401
 from .drivers import Driver, NoopDriver, V3ioDriver  # noqa: F401
+from .dtypes import BatchWriteCancelledError  # noqa: F401
 from .dtypes import EmissionType  # noqa: F401
 from .dtypes import EmitAfterDelay  # noqa: F401
 from .dtypes import EmitAfterMaxEvent  # noqa: F401

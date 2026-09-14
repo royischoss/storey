@@ -107,6 +107,12 @@ class FlowError(Exception):
     pass
 
 
+class BatchWriteCancelledError(Exception):
+    """Raised when a batching target's underlying write task is cancelled."""
+
+    pass
+
+
 class StreamingError(Exception):
     """Exception raised for streaming-related errors."""
 

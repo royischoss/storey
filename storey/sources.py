@@ -49,6 +49,13 @@ from .utils import (
 )
 
 
+def _copy_exception_or_original(error):
+    try:
+        return copy.copy(error)
+    except Exception:
+        return error
+
+
 class AwaitableResult:
     """
     Future result of a computation. Calling await_result() will return with the result once the computation is
@@ -451,7 +458,7 @@ class SyncEmitSource(Flow):
         if ex:
             # Python appends trace frames to a raised exception, so we must copy
             # it before raising to prevent it from growing each time
-            ex_copy = copy.copy(self._ex)
+            ex_copy = _copy_exception_or_original(self._ex)
             if self.verbose:
                 raise type(ex_copy)("Flow execution terminated") from ex_copy
             raise ex_copy
@@ -841,7 +848,7 @@ class AsyncEmitSource(Flow):
         if self._ex:
             # Python appends trace frames to a raised exception, so we must copy
             # it before raising to prevent it from growing each time
-            ex_copy = copy.copy(self._ex)
+            ex_copy = _copy_exception_or_original(self._ex)
             if self.verbose:
                 raise type(ex_copy)("Flow execution terminated") from ex_copy
             raise ex_copy

@@ -29,7 +29,7 @@ from datetime import datetime as _dt
 
 import pytest
 
-from storey import AsyncEmitSource, Event, build_flow
+from storey import AsyncEmitSource, BatchWriteCancelledError, Event, build_flow
 from storey.flow import _Batching
 
 # ---------------------------------------------------------------------------
@@ -90,16 +90,47 @@ class RecordingTarget(_Batching):
         self.terminate_called = True
 
 
+class NonCopyableError(Exception):
+    def __init__(self, code, detail):
+        self.code = code
+        self.detail = detail
+        super().__init__(detail)
+
+
+class FailingTerminationTarget(_Batching):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.terminate_called = False
+
+    async def _emit(self, batch, batch_key, batch_time, batch_events, last_event_time=None):
+        raise RuntimeError("final emit failed")
+
+    async def _terminate(self):
+        self.terminate_called = True
+
+
 class KeyedGatedTarget(_Batching):
     """Keyed batching target with deterministic per-physical-batch emit gates."""
 
     _do_downstream_per_event = True
 
-    def __init__(self, blocked_batch_keys=None, failed_batch_keys=None, **kwargs):
-        kwargs.setdefault("flush_key_field", "$key")
+    def __init__(
+        self,
+        blocked_batch_keys=None,
+        failed_batch_keys=None,
+        errors_by_batch_key=None,
+        cancelled_batch_keys=None,
+        terminate_error=None,
+        **kwargs,
+    ):
+        kwargs.setdefault("_flush_key_field", "$key")
         super().__init__(**kwargs)
         self.blocked_batch_keys = set(blocked_batch_keys or ())
         self.failed_batch_keys = set(failed_batch_keys or ())
+        self.errors_by_batch_key = dict(errors_by_batch_key or {})
+        self.cancelled_batch_keys = set(cancelled_batch_keys or ())
+        self.terminate_error = terminate_error
+        self.terminate_called = False
         self.emitted_batches = []
         self.emitted_batch_events = []
         self.emit_count_by_key = {}
@@ -137,6 +168,9 @@ class KeyedGatedTarget(_Batching):
         self.accepted_event(event.body["v"]).set()
         return entry
 
+    async def flush(self, flush_key):
+        await self._flush_by_key(flush_key)
+
     async def _emit(self, batch, batch_key, batch_time, batch_events, last_event_time=None):
         self.emit_count_by_key[batch_key] = self.emit_count_by_key.get(batch_key, 0) + 1
         self.emit_count_event(batch_key, self.emit_count_by_key[batch_key]).set()
@@ -144,12 +178,21 @@ class KeyedGatedTarget(_Batching):
         try:
             if batch_key in self.blocked_batch_keys:
                 await self._event_for(self._release_events, batch_key).wait()
+            if batch_key in self.cancelled_batch_keys:
+                raise asyncio.CancelledError()
+            if batch_key in self.errors_by_batch_key:
+                raise self.errors_by_batch_key[batch_key]
             if batch_key in self.failed_batch_keys:
                 raise RuntimeError(f"emit failed for {batch_key}")
             self.emitted_batches.append((batch_key, list(batch)))
             self.emitted_batch_events.append((batch_key, list(batch_events)))
         finally:
             self.emit_finished_event(batch_key).set()
+
+    async def _terminate(self):
+        self.terminate_called = True
+        if self.terminate_error is not None:
+            raise self.terminate_error
 
 
 def _ev(value, key=None):
@@ -316,7 +359,20 @@ class TestKeyedBatchFlush:
             await asyncio.gather(first_flush, second_flush)
             assert target.emit_count_by_key == {"partition-A": 1}
             assert [event.body["v"] for _, events in target.emitted_batch_events for event in events] == [1]
+            assert "endpoint-A" not in target._flush_states
 
+            await controller.terminate(wait=True)
+
+        asyncio.run(_test())
+
+    def test_unknown_key_flush_does_not_retain_state(self):
+        async def _test():
+            target = self._target()
+            controller = build_flow([AsyncEmitSource(), target]).run()
+
+            await target.flush("endpoint-never-seen")
+
+            assert not target._flush_states
             await controller.terminate(wait=True)
 
         asyncio.run(_test())
@@ -376,12 +432,53 @@ class TestKeyedBatchFlush:
 
             with pytest.raises(RuntimeError, match="emit failed for partition-A"):
                 await target.flush("endpoint-A")
+            target.failed_batch_keys.clear()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(2, "endpoint-A", "partition-A"))
             with pytest.raises(RuntimeError, match="emit failed for partition-A"):
                 await target.flush("endpoint-A")
-            assert target.emit_count_by_key == {"partition-A": 1}
+            assert target.emit_count_by_key == {"partition-A": 2}
+            assert [event.body["v"] for _, events in target.emitted_batch_events for event in events] == [2]
 
             with pytest.raises(RuntimeError, match="emit failed for partition-A"):
                 await controller.terminate(wait=True)
+
+        asyncio.run(_test())
+
+    def test_flush_retains_non_copyable_write_error(self):
+        async def _test():
+            write_error = NonCopyableError(503, "storage unavailable")
+            target = self._target(errors_by_batch_key={"partition-A": write_error})
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
+
+            for _ in range(2):
+                with pytest.raises(NonCopyableError) as exc_info:
+                    await target.flush("endpoint-A")
+                assert exc_info.value.code == 503
+                assert exc_info.value.detail == "storage unavailable"
+                assert not target._flush_states["endpoint-A"].in_flight
+
+            with pytest.raises(NonCopyableError):
+                await controller.terminate(wait=True)
+            assert target.terminate_called
+
+        asyncio.run(_test())
+
+    def test_composite_event_key_is_normalized_for_flush(self):
+        async def _test():
+            target = self._target()
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await _emit_and_wait_until_accepted(
+                controller,
+                target,
+                _partitioned_ev(1, ["tenant-1", "endpoint-A"], "partition-A"),
+            )
+
+            await target.flush(["tenant-1", "endpoint-A"])
+
+            assert target.emit_count_by_key == {"partition-A": 1}
+            assert not target._flush_states
+            await controller.terminate(wait=True)
 
         asyncio.run(_test())
 
@@ -444,7 +541,10 @@ class TestKeyedBatchFlush:
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(flush_task, timeout=0)
 
-            assert not next(iter(target._in_flight_batches["endpoint-A"])).cancelled()
+            state = target._flush_states.get("endpoint-A")
+            assert state is not None
+            assert state.in_flight
+            assert all(not task.cancelled() for task in state.in_flight.values())
             target.release("partition-A")
             await target.emit_finished_event("partition-A").wait()
             await target.flush("endpoint-A")
@@ -474,6 +574,20 @@ class TestKeyedBatchFlush:
                 await target.flush("endpoint-A")
             with pytest.raises(RuntimeError, match="emit failed for partition-A"):
                 await controller.terminate(wait=True)
+
+        asyncio.run(_test())
+
+    def test_underlying_write_cancellation_is_not_caller_cancellation(self):
+        async def _test():
+            target = self._target(cancelled_batch_keys={"partition-A"})
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
+
+            with pytest.raises(BatchWriteCancelledError, match="cancelled before completion"):
+                await target.flush("endpoint-A")
+            with pytest.raises(BatchWriteCancelledError):
+                await controller.terminate(wait=True)
+            assert target.terminate_called
 
         asyncio.run(_test())
 
@@ -519,18 +633,100 @@ class TestKeyedBatchFlush:
 
         asyncio.run(_test())
 
-    def test_flush_requires_logical_key_configuration(self):
+    def test_termination_drains_all_batches_and_aggregates_failures(self):
+        async def _test():
+            target = self._target(
+                errors_by_batch_key={
+                    "partition-A": RuntimeError("write A failed"),
+                    "partition-B": ValueError("write B failed"),
+                },
+                terminate_error=OSError("cleanup failed"),
+            )
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(2, "endpoint-B", "partition-B"))
+
+            with pytest.raises(ExceptionGroup) as exc_info:
+                await controller.terminate(wait=True)
+
+            assert target.emit_count_by_key == {"partition-A": 1, "partition-B": 1}
+            assert target.terminate_called
+            errors = exc_info.value.exceptions
+            assert [type(error) for error in errors] == [RuntimeError, ValueError, OSError]
+            assert [str(error) for error in errors] == [
+                "write A failed",
+                "write B failed",
+                "cleanup failed",
+            ]
+
+        asyncio.run(_test())
+
+    def test_flush_is_rejected_during_and_after_termination(self):
+        async def _test():
+            target = self._target(blocked_batch_keys={"partition-A"})
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
+
+            termination_task = asyncio.create_task(controller.terminate(wait=True))
+            await target.emit_started_event("partition-A").wait()
+            with pytest.raises(RuntimeError, match="termination has started"):
+                await target.flush("endpoint-A")
+
+            target.release("partition-A")
+            await termination_task
+            with pytest.raises(RuntimeError, match="termination has started"):
+                await target.flush("endpoint-A")
+
+        asyncio.run(_test())
+
+    def test_termination_cancellation_waits_for_write_cleanup_then_propagates(self):
+        async def _test():
+            target = self._target(blocked_batch_keys={"partition-A"})
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
+
+            termination_task = asyncio.create_task(controller.terminate(wait=True))
+            await target.emit_started_event("partition-A").wait()
+            termination_task.cancel()
+            await _assert_pending(termination_task)
+
+            target.release("partition-A")
+            with pytest.raises(asyncio.CancelledError):
+                await termination_task
+            assert target.terminate_called
+            assert target.emit_count_by_key == {"partition-A": 1}
+
+        asyncio.run(_test())
+
+    def test_flush_is_not_public_on_other_batching_targets(self):
         async def _test():
             target = GatedTarget()
             controller = build_flow([AsyncEmitSource(), target]).run()
-            with pytest.raises(ValueError, match="flush_key_field"):
-                await target.flush("endpoint-A")
+            assert not hasattr(target, "flush")
             await controller.terminate(wait=True)
 
         asyncio.run(_test())
 
+    def test_other_batching_targets_reject_flush_key_field(self):
+        with pytest.raises(TypeError, match="only by ParquetTarget"):
+            GatedTarget(flush_key_field="$key")
+
 
 class TestBatchingRaceConditions:
+    """Verify timer, event-ingestion, and termination batching races."""
+
+    def test_failed_final_emit_preserves_legacy_termination_behavior(self):
+        async def _test():
+            target = FailingTerminationTarget()
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await controller.emit(_ev(1))
+
+            with pytest.raises(RuntimeError, match="final emit failed"):
+                await controller.terminate(wait=True)
+            assert not target.terminate_called
+
+        asyncio.run(_test())
+
     def test_race2_events_deleted_by_concurrent_finally(self):
         """Events arriving during a slow _emit go into a separate list.
 

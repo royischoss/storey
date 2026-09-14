@@ -1407,6 +1407,7 @@ async def async_test_write_parquet_flush_by_logical_key(tmpdir):
     )
     controller = build_flow([AsyncEmitSource(), target, Complete()]).run()
 
+    # Complete makes controller.emit wait until ParquetTarget has accepted each event.
     await controller.emit(Event({"v": 1}, key="endpoint-A", processing_time=datetime(2026, 1, 1, 10)))
     await controller.emit(Event({"v": 2}, key="endpoint-A", processing_time=datetime(2026, 1, 1, 11)))
     await target.flush(flush_key="endpoint-A")
@@ -1476,6 +1477,78 @@ def test_write_parquet_flush_by_logical_key_without_pending_batch(tmpdir):
 def test_write_parquet_flush_by_logical_key_rejects_single_file(tmpdir):
     with pytest.raises(ValueError, match="single-file mode"):
         ParquetTarget(f"{tmpdir}/target.parquet", flush_key_field="$key")
+
+
+def test_write_parquet_flush_key_field_rejects_callable(tmpdir):
+    with pytest.raises(TypeError, match="must be a string"):
+        ParquetTarget(str(tmpdir), flush_key_field=lambda event: event.key)
+
+
+def test_flush_key_field_is_rejected_by_non_parquet_target(tmpdir):
+    with pytest.raises(TypeError, match="only by ParquetTarget"):
+        CSVTarget(f"{tmpdir}/events.csv", flush_key_field="$key")
+
+
+async def async_test_write_parquet_flush_by_composite_key(tmpdir):
+    out_dir = f"{tmpdir}/test_write_parquet_flush_by_composite_key/{uuid.uuid4().hex}/"
+    target = ParquetTarget(
+        out_dir,
+        columns=["v"],
+        partition_cols=["$key"],
+        flush_key_field="$key",
+    )
+    controller = build_flow([AsyncEmitSource(), target, Complete()]).run()
+
+    composite_key = ["tenant-1", "endpoint-A"]
+    await controller.emit(Event({"v": 1}, key=composite_key))
+    await target.flush(composite_key)
+
+    assert pq.read_table(out_dir).to_pandas()["v"].tolist() == [1]
+    await controller.terminate(wait=True)
+
+
+def test_write_parquet_flush_by_composite_key(tmpdir):
+    asyncio.run(async_test_write_parquet_flush_by_composite_key(tmpdir))
+
+
+async def async_test_parquet_last_written_advances_only_after_success(tmpdir):
+    target = ParquetTarget(f"{tmpdir}/last-written/")
+
+    def fail_write(*args):
+        raise OSError("close failed")
+
+    target._blocking_emit = fail_write
+    with pytest.raises(OSError, match="close failed"):
+        await target._emit([], None, None, [], datetime(2026, 1, 1, 10))
+    assert target._last_written_event is None
+
+
+def test_parquet_last_written_advances_only_after_success(tmpdir):
+    asyncio.run(async_test_parquet_last_written_advances_only_after_success(tmpdir))
+
+
+async def async_test_parquet_last_written_is_monotonic_for_concurrent_writes(tmpdir):
+    target = ParquetTarget(f"{tmpdir}/last-written-concurrent/")
+    older_write_started = threading.Event()
+    release_older_write = threading.Event()
+
+    def controlled_write(batch, batch_key, batch_time, batch_events, last_event_time=None):
+        if last_event_time.hour == 10:
+            older_write_started.set()
+            release_older_write.wait()
+
+    target._blocking_emit = controlled_write
+    older_write = asyncio.create_task(target._emit([], None, None, [], datetime(2026, 1, 1, 10)))
+    await asyncio.get_running_loop().run_in_executor(None, older_write_started.wait)
+    await target._emit([], None, None, [], datetime(2026, 1, 1, 11))
+    release_older_write.set()
+    await older_write
+
+    assert target._last_written_event == datetime(2026, 1, 1, 11)
+
+
+def test_parquet_last_written_is_monotonic_for_concurrent_writes(tmpdir):
+    asyncio.run(async_test_parquet_last_written_is_monotonic_for_concurrent_writes(tmpdir))
 
 
 def test_parquet_flush_with_inconsistent_schema_logs_error(tmpdir):
@@ -4346,6 +4419,19 @@ def test_flow_to_dict_read_csv():
 
 
 def test_flow_to_dict_write_to_parquet():
+    step = ParquetTarget("outdir", columns=["col1", "col2"], max_events=2)
+    assert step.to_dict() == {
+        "class_name": "storey.targets.ParquetTarget",
+        "class_args": {
+            "path": "outdir",
+            "columns": ["col1", "col2"],
+            "max_events": 2,
+        },
+        "name": "ParquetTarget",
+    }
+
+
+def test_flow_to_dict_write_to_parquet_with_flush_key():
     step = ParquetTarget("outdir", columns=["col1", "col2"], max_events=2, flush_key_field="$key")
     assert step.to_dict() == {
         "class_name": "storey.targets.ParquetTarget",
