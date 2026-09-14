@@ -30,7 +30,8 @@ from datetime import datetime as _dt
 import pytest
 
 from storey import AsyncEmitSource, BatchWriteCancelledError, Event, build_flow
-from storey.flow import _Batching
+from storey.dtypes import _termination_obj
+from storey.flow import Flow, _Batching
 
 # ---------------------------------------------------------------------------
 # Helpers — real _Batching subclasses matching production config
@@ -88,6 +89,19 @@ class RecordingTarget(_Batching):
         else:
             self.timeout_task_alive_during_terminate = False
         self.terminate_called = True
+
+
+class TerminationProbe(Flow):
+    """Downstream step recording whether it received the termination signal."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.terminated = False
+
+    async def _do(self, event):
+        if event is _termination_obj:
+            self.terminated = True
+        return await self._do_downstream(event)
 
 
 class NonCopyableError(Exception):
@@ -661,6 +675,23 @@ class TestKeyedBatchFlush:
 
         asyncio.run(_test())
 
+    def test_termination_forwards_downstream_even_when_writes_failed(self):
+        async def _test():
+            target = self._target(errors_by_batch_key={"partition-A": RuntimeError("write A failed")})
+            probe = TerminationProbe()
+            controller = build_flow([AsyncEmitSource(), target, probe]).run()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
+
+            with pytest.raises(RuntimeError, match="write A failed"):
+                await target.flush("endpoint-A")
+
+            with pytest.raises(RuntimeError, match="write A failed"):
+                await controller.terminate(wait=True)
+            assert target.terminate_called
+            assert probe.terminated
+
+        asyncio.run(_test())
+
     def test_flush_retains_all_failures_for_same_logical_key(self):
         async def _test():
             target = self._target(
@@ -673,11 +704,13 @@ class TestKeyedBatchFlush:
             await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
             await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(2, "endpoint-A", "partition-B"))
 
+            # A flush starts the key's physical batches in arbitrary order, so only the
+            # set of reported failures is defined, not their relative order.
             for operation in (lambda: target.flush("endpoint-A"), lambda: controller.terminate(wait=True)):
                 with pytest.raises(ExceptionGroup) as exc_info:
                     await operation()
-                assert [type(error) for error in exc_info.value.exceptions] == [RuntimeError, ValueError]
-                assert [str(error) for error in exc_info.value.exceptions] == [
+                assert {type(error) for error in exc_info.value.exceptions} == {RuntimeError, ValueError}
+                assert sorted(str(error) for error in exc_info.value.exceptions) == [
                     "write A failed",
                     "write B failed",
                 ]

@@ -1770,6 +1770,11 @@ class _Batching(Flow):
                             f"{traceback.format_exc()}"
                         )
                 raise
+            except Exception:
+                # Downstream steps still own resources (file handles, connection pools),
+                # so they must be terminated even when our own writes failed.
+                await self._do_downstream(_termination_obj)
+                raise
             return await self._do_downstream(_termination_obj)
 
         key = self._extract_key(event)
