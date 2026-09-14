@@ -96,7 +96,7 @@ class AwaitableResult:
         if isinstance(first_result, BaseException):
             if self._on_error:
                 self._on_error()
-            raise copy.copy(first_result)
+            raise _copy_exception_or_original(first_result)
 
         # If this is a stream response, return a generator
         if isinstance(first_result, (StreamChunk, StreamCompletion)):
@@ -109,7 +109,7 @@ class AwaitableResult:
             if isinstance(result, BaseException):
                 if self._on_error:
                     self._on_error()
-                raise copy.copy(result)
+                raise _copy_exception_or_original(result)
             results.append(result)
 
         if len(results) == 1:
@@ -133,7 +133,7 @@ class AwaitableResult:
             if isinstance(item, BaseException):
                 if self._on_error:
                     self._on_error()
-                raise copy.copy(item)
+                raise _copy_exception_or_original(item)
             if isinstance(item, StreamCompletion):
                 if item.error:
                     if self._on_error:
@@ -529,7 +529,7 @@ class AsyncAwaitableResult:
         if isinstance(first_result, BaseException):
             if self._on_error:
                 await self._on_error()
-            raise copy.copy(first_result)
+            raise _copy_exception_or_original(first_result)
 
         # If this is a stream response, return a generator
         if isinstance(first_result, (StreamChunk, StreamCompletion)):
@@ -542,7 +542,7 @@ class AsyncAwaitableResult:
             if isinstance(result, BaseException):
                 if self._on_error:
                     await self._on_error()
-                raise copy.copy(result)
+                raise _copy_exception_or_original(result)
             results.append(result)
 
         if len(results) == 1:
@@ -566,7 +566,7 @@ class AsyncAwaitableResult:
             if isinstance(item, BaseException):
                 if self._on_error:
                     await self._on_error()
-                raise copy.copy(item)
+                raise _copy_exception_or_original(item)
             if isinstance(item, StreamCompletion):
                 if item.error:
                     if self._on_error:

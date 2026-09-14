@@ -1594,14 +1594,14 @@ class _BatchingFailure:
 
 
 class _BatchingFlushState:
-    __slots__ = ("lock", "users", "batch_keys", "in_flight", "failure")
+    __slots__ = ("lock", "users", "batch_keys", "in_flight", "failures")
 
     def __init__(self):
         self.lock = asyncio.Lock()
         self.users = 0
         self.batch_keys = set()
         self.in_flight = {}
-        self.failure = None
+        self.failures = {}
 
 
 class _Batching(Flow):
@@ -1722,7 +1722,7 @@ class _Batching(Flow):
             state.users == 0
             and not state.batch_keys
             and not state.in_flight
-            and state.failure is None
+            and not state.failures
             and self._flush_states.get(flush_key) is state
         ):
             self._flush_states.pop(flush_key)
@@ -1883,8 +1883,7 @@ class _Batching(Flow):
 
         if error is not None:
             for _, state in states:
-                if state.failure is None or sequence < state.failure.sequence:
-                    state.failure = _BatchingFailure(sequence, error)
+                state.failures.setdefault(sequence, _BatchingFailure(sequence, error))
 
         for flush_key, state in states:
             self._maybe_remove_flush_state(flush_key, state)
@@ -1947,8 +1946,8 @@ class _Batching(Flow):
     def _retained_failures(self):
         failures = {}
         for state in self._flush_states.values():
-            if state.failure is not None:
-                failures.setdefault(state.failure.sequence, state.failure)
+            for sequence, failure in state.failures.items():
+                failures.setdefault(sequence, failure)
         return list(failures.values())
 
     async def _terminate_with_flush_tracking(self):
@@ -1989,10 +1988,10 @@ class _Batching(Flow):
     async def _flush_by_key(self, flush_key):
         if self._extract_flush_key is None:
             raise ValueError("flush_key_field must be configured before flushing by key")
-        if self._terminating or self._terminated:
-            raise RuntimeError(f"Cannot flush Batching step '{self.name}' after termination has started")
         if not hasattr(self, "_flush_states"):
             raise RuntimeError(f"Batching step '{self.name}' must be running before it can be flushed")
+        if self._terminating or self._terminated:
+            raise RuntimeError(f"Cannot flush Batching step '{self.name}' after termination has started")
 
         flush_key = self._normalize_flush_key(flush_key)
         state = self._flush_states.get(flush_key)
@@ -2007,7 +2006,7 @@ class _Batching(Flow):
                 for batch_key in list(state.batch_keys):
                     self._start_tracked_batch_emit(batch_key)
 
-                failure = state.failure
+                failures = list(state.failures.values())
                 in_flight_batches = {sequence: (None, batch_task) for sequence, batch_task in state.in_flight.items()}
                 if in_flight_batches:
                     await asyncio.gather(
@@ -2015,7 +2014,6 @@ class _Batching(Flow):
                         return_exceptions=True,
                     )
 
-                failures = [failure] if failure is not None else []
                 failures.extend(self._task_failures(in_flight_batches))
                 self._raise_failures(failures)
         finally:

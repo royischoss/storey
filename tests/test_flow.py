@@ -92,6 +92,13 @@ class ATestException(Exception):
     pass
 
 
+class NonCopyableFlowError(Exception):
+    def __init__(self, code, detail):
+        self.code = code
+        self.detail = detail
+        super().__init__(detail)
+
+
 class RaiseEx:
     _counter = 0
 
@@ -1535,14 +1542,21 @@ async def async_test_parquet_last_written_is_monotonic_for_concurrent_writes(tmp
     def controlled_write(batch, batch_key, batch_time, batch_events, last_event_time=None):
         if last_event_time.hour == 10:
             older_write_started.set()
-            release_older_write.wait()
+            if not release_older_write.wait(timeout=2):
+                raise TimeoutError("test did not release older Parquet write")
 
     target._blocking_emit = controlled_write
     older_write = asyncio.create_task(target._emit([], None, None, [], datetime(2026, 1, 1, 10)))
-    await asyncio.get_running_loop().run_in_executor(None, older_write_started.wait)
-    await target._emit([], None, None, [], datetime(2026, 1, 1, 11))
-    release_older_write.set()
-    await older_write
+    try:
+        older_started = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(None, older_write_started.wait, 1),
+            timeout=2,
+        )
+        assert older_started
+        await target._emit([], None, None, [], datetime(2026, 1, 1, 11))
+    finally:
+        release_older_write.set()
+    await asyncio.wait_for(older_write, timeout=2)
 
     assert target._last_written_event == datetime(2026, 1, 1, 11)
 
@@ -2039,6 +2053,21 @@ def test_awaitable_result_error():
         controller.terminate()
 
 
+def test_awaitable_result_preserves_non_copyable_error():
+    error = NonCopyableFlowError(503, "storage unavailable")
+
+    def boom(_):
+        raise error
+
+    controller = build_flow([SyncEmitSource(), Map(boom), Complete()]).run()
+    try:
+        with pytest.raises(NonCopyableFlowError) as exc_info:
+            controller.emit(0).await_result()
+        assert exc_info.value is error
+    finally:
+        controller.terminate()
+
+
 def test_awaitable_result_cancelled():
     release = threading.Event()
 
@@ -2073,6 +2102,25 @@ async def async_test_async_awaitable_result_error():
 
 def test_async_awaitable_result_error():
     asyncio.run(async_test_async_awaitable_result_error())
+
+
+async def async_test_async_awaitable_result_preserves_non_copyable_error():
+    error = NonCopyableFlowError(503, "storage unavailable")
+
+    def boom(_):
+        raise error
+
+    controller = build_flow([AsyncEmitSource(), Map(boom), Complete()]).run()
+    try:
+        with pytest.raises(NonCopyableFlowError) as exc_info:
+            await controller.emit(0)
+        assert exc_info.value is error
+    finally:
+        await controller.terminate()
+
+
+def test_async_awaitable_result_preserves_non_copyable_error():
+    asyncio.run(async_test_async_awaitable_result_preserves_non_copyable_error())
 
 
 async def async_test_async_awaitable_result_cancelled():
@@ -4559,6 +4607,17 @@ parquet_target0 = ParquetTarget(path='mypq')
 c_s_v_source0.to(parquet_target0)
 """
     assert reconstructed_code == expected
+
+
+def test_parquet_flush_key_field_to_code():
+    flow = build_flow([CSVSource("mycsv.csv"), ParquetTarget("mypq", flush_key_field="$key")])
+
+    reconstructed_code = flow.to_code()
+    namespace = {"CSVSource": CSVSource, "ParquetTarget": ParquetTarget}
+    exec(reconstructed_code, namespace)
+
+    assert "ParquetTarget(path='mypq', flush_key_field='$key')" in reconstructed_code
+    assert namespace["parquet_target0"].to_dict()["class_args"]["flush_key_field"] == "$key"
 
 
 def test_illegal_step_no_source():

@@ -661,6 +661,29 @@ class TestKeyedBatchFlush:
 
         asyncio.run(_test())
 
+    def test_flush_retains_all_failures_for_same_logical_key(self):
+        async def _test():
+            target = self._target(
+                errors_by_batch_key={
+                    "partition-A": RuntimeError("write A failed"),
+                    "partition-B": ValueError("write B failed"),
+                }
+            )
+            controller = build_flow([AsyncEmitSource(), target]).run()
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
+            await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(2, "endpoint-A", "partition-B"))
+
+            for operation in (lambda: target.flush("endpoint-A"), lambda: controller.terminate(wait=True)):
+                with pytest.raises(ExceptionGroup) as exc_info:
+                    await operation()
+                assert [type(error) for error in exc_info.value.exceptions] == [RuntimeError, ValueError]
+                assert [str(error) for error in exc_info.value.exceptions] == [
+                    "write A failed",
+                    "write B failed",
+                ]
+
+        asyncio.run(_test())
+
     def test_flush_is_rejected_during_and_after_termination(self):
         async def _test():
             target = self._target(blocked_batch_keys={"partition-A"})
@@ -695,6 +718,14 @@ class TestKeyedBatchFlush:
                 await termination_task
             assert target.terminate_called
             assert target.emit_count_by_key == {"partition-A": 1}
+
+        asyncio.run(_test())
+
+    def test_flush_before_target_start_is_rejected(self):
+        async def _test():
+            target = self._target()
+            with pytest.raises(RuntimeError, match="must be running"):
+                await target.flush("endpoint-A")
 
         asyncio.run(_test())
 
