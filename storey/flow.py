@@ -1786,6 +1786,16 @@ class _Batching(Flow):
                             f"Failed to terminate Batching step '{self.name}' after cancellation: "
                             f"{termination_task.exception()}"
                         )
+                # Downstream steps own resources on this path too, so tear them down
+                # before propagating, matching the failure branch below.
+                try:
+                    await self._do_downstream(_termination_obj)
+                except Exception:
+                    if self.logger:
+                        self.logger.error(
+                            f"Failed to terminate steps downstream of Batching step '{self.name}' "
+                            f"after cancellation:\n{traceback.format_exc()}"
+                        )
                 raise
             except Exception:
                 # Downstream steps still own resources (file handles, connection pools),

@@ -535,8 +535,10 @@ class ParquetTarget(_Batching, _Writer):
         operation. Set to ``"$key"`` to flush by event key, another ``"$attribute"`` to use event metadata, or a body
         field name. A logical key is distinct from the physical partition path used to batch Parquet writes, allowing
         one fence to cover all partitions for an event key. Every event reaching the target must resolve this field.
-        If None (default), keyed flush is disabled. Keyed flush is not supported in single-file mode because later
-        writes would overwrite previously flushed data.
+        Once flow termination starts on a configured target it runs to completion even under cancellation, so any
+        external timeout wrapping shutdown is advisory rather than a bound. If None (default), keyed flush is
+        disabled. Keyed flush is not supported in single-file mode because later writes would overwrite previously
+        flushed data.
     :type flush_key_field: str
     """
 

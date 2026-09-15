@@ -742,7 +742,8 @@ class TestKeyedBatchFlush:
     def test_termination_cancellation_waits_for_write_cleanup_then_propagates(self):
         async def _test():
             target = self._target(blocked_batch_keys={"partition-A"})
-            controller = build_flow([AsyncEmitSource(), target]).run()
+            probe = TerminationProbe()
+            controller = build_flow([AsyncEmitSource(), target, probe]).run()
             await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
 
             termination_task = asyncio.create_task(controller.terminate(wait=True))
@@ -755,6 +756,8 @@ class TestKeyedBatchFlush:
                 await termination_task
             assert target.terminate_called
             assert target.emit_count_by_key == {"partition-A": 1}
+            # Downstream steps own resources too, so cancellation must not skip them.
+            assert probe.terminated
 
         asyncio.run(_test())
 
@@ -787,7 +790,8 @@ class TestKeyedBatchFlush:
     def test_repeated_termination_cancellation_still_completes_cleanup(self):
         async def _test():
             target = self._target(blocked_batch_keys={"partition-A"})
-            controller = build_flow([AsyncEmitSource(), target]).run()
+            probe = TerminationProbe()
+            controller = build_flow([AsyncEmitSource(), target, probe]).run()
             await _emit_and_wait_until_accepted(controller, target, _partitioned_ev(1, "endpoint-A", "partition-A"))
 
             termination_task = asyncio.create_task(controller.terminate(wait=True))
@@ -801,6 +805,7 @@ class TestKeyedBatchFlush:
                 await termination_task
             assert target.terminate_called
             assert target.emit_count_by_key == {"partition-A": 1}
+            assert probe.terminated
 
         asyncio.run(_test())
 
